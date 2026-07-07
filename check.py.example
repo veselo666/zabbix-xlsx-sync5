@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import sys
+import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+ZABBIX_URL = "https://127.0.0.1/api_jsonrpc.php"
+ZABBIX_USER = "login"
+ZABBIX_PASSWORD = "pass"
+
+VERIFY_SSL = False
+TIMEOUT = 30
+
+STATUS_ENABLED = "0"
+STATUS_DISABLED = "1"
+
+
+def zbx(method, params=None, auth=None):
+    payload = {
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params or {},
+        "id": 1,
+    }
+
+    if auth:
+        payload["auth"] = auth
+
+    r = requests.post(
+        ZABBIX_URL,
+        json=payload,
+        verify=VERIFY_SSL,
+        timeout=TIMEOUT,
+        headers={"Content-Type": "application/json-rpc"},
+    )
+    r.raise_for_status()
+    data = r.json()
+
+    if "error" in data:
+        raise Exception(f"{method}: {data['error']}")
+
+    return data["result"]
+
+
+def login():
+    return zbx(
+        "user.login",
+        {
+            "user": ZABBIX_USER,
+            "password": ZABBIX_PASSWORD,
+        },
+    )
+
+
+def chunks(lst, size=500):
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
+
+
+def get_host(auth, host_name):
+    for field in ("host", "name"):
+        result = zbx(
+            "host.get",
+            {
+                "output": ["hostid", "host", "name"],
+                "filter": {field: [host_name]},
+            },
+            auth,
+        )
+        if result:
+            return result[0]
+    return None
+
+
+def get_template_names(auth, template_ids):
+    names = {}
+
+    for part in chunks(list(template_ids)):
+        rows = zbx(
+            "template.get",
+            {
+                "output": ["templateid", "host", "name"],
+                "templateids": part,
+            },
+            auth,
+        )
+
+        for t in rows:
+            names[t["templateid"]] = t.get("name") or t.get("host")
+
+    return names
+
+
+def get_parent_template_items(auth, template_item_ids):
+    parents = {}
+
+    for part in chunks(list(template_item_ids)):
+        rows = zbx(
+            "item.get",
+            {
+                "output": ["itemid", "hostid", "name", "key_"],
+                "itemids": part,
+            },
+            auth,
+        )
+
+        for item in rows:
+            parents[item["itemid"]] = item
+
+    return parents
+
+
+def has_latestdata(item):
+    """
+    В Zabbix latestdata считаем существующим, если lastclock заполнен и не равен 0.
+    lastvalue может быть '0' — это нормальное значение, поэтому его не проверяем как bool.
+    """
+    return item.get("lastclock") not in (None, "", "0")
+
+
+def check_host(auth, host):
+    items = zbx(
+        "item.get",
+        {
+            "output": [
+                "itemid",
+                "name",
+                "key_",
+                "status",
+                "state",
+                "lastclock",
+                "lastvalue",
+                "templateid",
+            ],
+            "hostids": host["hostid"],
+            "inherited": True,
+            "sortfield": "name",
+        },
+        auth,
+    )
+
+    template_item_ids = {
+        i["templateid"]
+        for i in items
+        if i.get("templateid") not in ("0", "", None)
+    }
+
+    parent_items = get_parent_template_items(auth, template_item_ids)
+
+    template_ids = {
+        p["hostid"]
+        for p in parent_items.values()
+        if p.get("hostid")
+    }
+
+    template_names = get_template_names(auth, template_ids)
+
+    report = {}
+
+    for item in items:
+        if item.get("templateid") in ("0", "", None):
+            continue
+
+        parent = parent_items.get(item["templateid"])
+        if not parent:
+            continue
+
+        template_id = parent["hostid"]
+        template_name = template_names.get(template_id, f"templateid:{template_id}")
+
+        if template_name not in report:
+            report[template_name] = {
+                "missing": [],
+                "disabled": 0,
+                "checked": 0,
+            }
+
+        if item["status"] == STATUS_DISABLED:
+            report[template_name]["disabled"] += 1
+            continue
+
+        if item["status"] == STATUS_ENABLED:
+            report[template_name]["checked"] += 1
+
+            if not has_latestdata(item):
+                report[template_name]["missing"].append(item)
+
+    return report
+
+
+def print_report(host, report):
+    print("")
+    print(f"Хост: {host['host']} / {host.get('name') or host['host']}")
+    print("=" * 80)
+
+    for template_name in sorted(report):
+        data = report[template_name]
+
+        if data["missing"]:
+            print(f"{template_name} / проверка НЕ ПРОЙДЕНА")
+            print("  Элементы данных без latestdata:")
+
+            for item in data["missing"]:
+                print(
+                    f"    - {item['name']} | key={item['key_']} | "
+                    f"itemid={item['itemid']} | state={item.get('state')}"
+                )
+        else:
+            print(f"{template_name} / проверка пройдена")
+
+        print(
+            f"  Проверено включённых item: {data['checked']}, "
+            f"выключенных item пропущено: {data['disabled']}"
+        )
+        print("")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"Использование: {sys.argv[0]} host1 host2 host3")
+        sys.exit(2)
+
+    auth = login()
+    exit_code = 0
+
+    try:
+        for host_arg in sys.argv[1:]:
+            host = get_host(auth, host_arg)
+
+            if not host:
+                print(f"[ERROR] Хост не найден: {host_arg}")
+                exit_code = 2
+                continue
+
+            report = check_host(auth, host)
+            print_report(host, report)
+
+            for template_data in report.values():
+                if template_data["missing"]:
+                    exit_code = 1
+
+    finally:
+        try:
+            zbx("user.logout", [], auth)
+        except Exception:
+            pass
+
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
