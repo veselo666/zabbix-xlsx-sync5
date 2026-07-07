@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import sys
+import csv
+import requests
+import urllib3
+from datetime import datetime
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+ZABBIX_URL = "https://127.0.0.1/api_jsonrpc.php"
+ZABBIX_USER = "login"
+ZABBIX_PASSWORD = "pass"
+
+TOKEN = None
+
+
+def api(method, params=None):
+    global TOKEN
+
+    request = {
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": {} if params is None else params,
+        "id": 1,
+    }
+
+    if TOKEN:
+        request["auth"] = TOKEN
+
+    response = requests.post(
+        ZABBIX_URL,
+        json=request,
+        verify=False,
+        timeout=60,
+    )
+
+    data = response.json()
+
+    if "error" in data:
+        raise Exception(data["error"])
+
+    return data["result"]
+
+
+def date_to_timestamp(date_string):
+    """
+    Формат даты:
+    2026-07-07 10:00:00
+    """
+    dt = datetime.strptime(date_string, "%Y-%m-%d %H:%M:%S")
+    return int(dt.timestamp())
+
+
+def timestamp_to_date(ts):
+    return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def find_host(host_name):
+    # Сначала ищем по technical name
+    hosts = api("host.get", {
+        "output": ["hostid", "host", "name"],
+        "filter": {
+            "host": [host_name],
+        },
+    })
+
+    # Если не нашли — ищем по visible name
+    if not hosts:
+        hosts = api("host.get", {
+            "output": ["hostid", "host", "name"],
+            "filter": {
+                "name": [host_name],
+            },
+        })
+
+    if hosts:
+        return hosts[0]
+
+    return None
+
+
+def find_item(hostid, item_name):
+    # Сначала ищем item по key_
+    items = api("item.get", {
+        "output": ["itemid", "name", "key_", "value_type", "status"],
+        "hostids": [hostid],
+        "filter": {
+            "key_": [item_name],
+        },
+    })
+
+    # Если по key_ не нашли — ищем по имени item
+    if not items:
+        items = api("item.get", {
+            "output": ["itemid", "name", "key_", "value_type", "status"],
+            "hostids": [hostid],
+            "filter": {
+                "name": [item_name],
+            },
+        })
+
+    # Если точного совпадения нет — пробуем поиск по части имени
+    if not items:
+        items = api("item.get", {
+            "output": ["itemid", "name", "key_", "value_type", "status"],
+            "hostids": [hostid],
+            "search": {
+                "name": item_name,
+            },
+        })
+
+    return items
+
+
+def get_history(item, time_from, time_till):
+    """
+    value_type item в Zabbix соответствует типу history:
+    0 - Numeric float
+    1 - Character
+    2 - Log
+    3 - Numeric unsigned
+    4 - Text
+    """
+    history_type = int(item["value_type"])
+
+    history = api("history.get", {
+        "output": "extend",
+        "history": history_type,
+        "itemids": [item["itemid"]],
+        "time_from": time_from,
+        "time_till": time_till,
+        "sortfield": "clock",
+        "sortorder": "ASC",
+    })
+
+    return history
+
+
+def save_to_csv(filename, host, item, history):
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, delimiter=";")
+
+        writer.writerow([
+            "host",
+            "itemid",
+            "item_name",
+            "item_key",
+            "datetime",
+            "clock",
+            "value",
+        ])
+
+        for row in history:
+            writer.writerow([
+                host["host"],
+                item["itemid"],
+                item["name"],
+                item["key_"],
+                timestamp_to_date(row["clock"]),
+                row["clock"],
+                row.get("value", ""),
+            ])
+
+
+if len(sys.argv) < 5:
+    print("")
+    print("Использование:")
+    print(f"  {sys.argv[0]} '<host>' '<item_key_or_name>' '<time_from>' '<time_till>' [output.csv]")
+    print("")
+    print("Пример:")
+    print(f"  {sys.argv[0]} 'cr-s-zbxap01' 'system.cpu.load[all,avg1]' '2026-07-07 10:00:00' '2026-07-07 12:00:00'")
+    print("")
+    print("Пример с файлом:")
+    print(f"  {sys.argv[0]} 'cr-s-zbxap01' 'system.cpu.load[all,avg1]' '2026-07-07 10:00:00' '2026-07-07 12:00:00' cpu_history.csv")
+    print("")
+    sys.exit(2)
+
+
+try:
+    host_name = sys.argv[1]
+    item_name = sys.argv[2]
+    time_from_text = sys.argv[3]
+    time_till_text = sys.argv[4]
+
+    if len(sys.argv) >= 6:
+        output_file = sys.argv[5]
+    else:
+        output_file = "zabbix_history.csv"
+
+    time_from = date_to_timestamp(time_from_text)
+    time_till = date_to_timestamp(time_till_text)
+
+    if time_from >= time_till:
+        print("[ERROR] time_from должен быть меньше time_till")
+        sys.exit(2)
+
+    TOKEN = api("user.login", {
+        "user": ZABBIX_USER,
+        "password": ZABBIX_PASSWORD,
+    })
+
+    host = find_host(host_name)
+
+    if not host:
+        print(f"[ERROR] Хост не найден: {host_name}")
+        sys.exit(2)
+
+    items = find_item(host["hostid"], item_name)
+
+    if not items:
+        print(f"[ERROR] Item не найден: {item_name}")
+        sys.exit(2)
+
+    if len(items) > 1:
+        print("[ERROR] Найдено несколько item, уточни key_ или имя:")
+        print("")
+        for item in items:
+            print(
+                f"itemid={item['itemid']} | "
+                f"name={item['name']} | "
+                f"key={item['key_']} | "
+                f"value_type={item['value_type']} | "
+                f"status={item['status']}"
+            )
+        sys.exit(2)
+
+    item = items[0]
+
+    print("")
+    print(f"Хост: {host['host']} / {host.get('name') or host['host']}")
+    print(f"Item: {item['name']}")
+    print(f"Key: {item['key_']}")
+    print(f"ItemID: {item['itemid']}")
+    print(f"Value type: {item['value_type']}")
+    print(f"Период: {time_from_text} - {time_till_text}")
+    print("")
+
+    history = get_history(item, time_from, time_till)
+
+    save_to_csv(output_file, host, item, history)
+
+    print(f"Выгружено значений: {len(history)}")
+    print(f"Файл: {output_file}")
+
+    try:
+        api("user.logout", [])
+    except Exception:
+        pass
+
+except Exception as e:
+    print(f"[ERROR] {e}")
+    sys.exit(2)
